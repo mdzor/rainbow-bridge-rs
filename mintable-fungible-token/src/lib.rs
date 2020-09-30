@@ -25,6 +25,7 @@ Properties inherited from the standard Fungible Token:
 *    keys on its account.
 */
 use borsh::{BorshDeserialize, BorshSerialize};
+use bigint::U256;
 use near_sdk::collections::{UnorderedMap, UnorderedSet};
 use near_sdk::json_types::U128;
 use near_sdk::{
@@ -39,10 +40,14 @@ static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
 /// Price per 1 byte of storage from mainnet genesis config.
 const STORAGE_PRICE_PER_BYTE: Balance = 100000000000000000000;
 
+const MAX_UINT256: U256 = U256([2^64,2^64,2^64,2^64]);
+const INITIAL_FRAGMENTS_SUPPLY: U256 = U256([50, 10^6, 10^9, 0]);
+const MAX_SUPPLY: u128 = (2^128) - 1;
+
 /// Contains balance and allowances information for one account.
 #[derive(BorshDeserialize, BorshSerialize)]
 pub struct Account {
-    /// Current account balance.
+    /// Current Gons account balance.
     pub balance: Balance,
     /// Escrow Account ID hash to the allowance amount.
     /// Allowance is the amount of tokens the Escrow Account ID can spent on behalf of the account
@@ -84,6 +89,8 @@ pub struct MintableFungibleToken {
 
     /// Total supply of the all token.
     pub total_supply: Balance,
+    /// Total gons per fragment
+    pub gons_per_fragment: Balance,
     /// The account of the prover that we can use to prove
     pub prover_account: AccountId,
     /// Address of the Ethereum locker contract.
@@ -205,6 +212,55 @@ impl EthEventData {
     }
 }
 
+/// Data that was emitted by the AMLP event.
+pub struct LogRebase {
+    pub total_supply: Balance,
+    pub epoch: String,
+}
+
+impl LogRebase {
+    /// Parse raw log entry data.
+    pub fn from_log_entry_data(data: &[u8]) -> Self {
+        use eth_types::*;
+        use ethabi::{Event, EventParam, Hash, ParamType, RawLog};
+        use hex::ToHex;
+
+        let event = Event {
+            name: "LogRebase".to_string(),
+            inputs: vec![
+                EventParam {
+                    name: "totalSupply".to_string(),
+                    kind: ParamType::Uint(256),
+                    indexed: false,
+                },
+                EventParam {
+                    name: "epoch".to_string(),
+                    kind: ParamType::String,
+                    indexed: false,
+                },
+            ],
+            anonymous: false,
+        };
+        let log_entry: LogEntry = rlp::decode(data).unwrap();
+        let raw_log = RawLog {
+            topics: log_entry
+                .topics
+                .iter()
+                .map(|h| Hash::from(&((h.0).0)))
+                .collect(),
+            data: log_entry.data.clone(),
+        };
+        let log = event.parse_log(raw_log).unwrap();
+        let total_supply = log.params[0].value.clone().to_uint().unwrap().as_u128();
+        let epoch = log.params[1].value.clone().to_address().unwrap().0;
+        let epoch = (&epoch).encode_hex::<String>();
+        Self {
+            total_supply,
+            epoch,
+        }
+    }
+}
+
 impl std::fmt::Display for EthEventData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -244,6 +300,7 @@ impl MintableFungibleToken {
         Self {
             accounts: UnorderedMap::new(b"a".to_vec()),
             total_supply: 0,
+            gons_per_fragment: 0,
             prover_account,
             locker_address,
             used_events: UnorderedSet::new(b"u".to_vec()),
@@ -376,7 +433,7 @@ impl MintableFungibleToken {
 
     /// Returns balance of the `owner_id` account.
     pub fn get_balance(&self, owner_id: AccountId) -> U128 {
-        self.get_account(&owner_id).balance.into()
+        (self.get_account(&owner_id).balance / self.gons_per_fragment).into()
     }
 
     /// Returns current allowance of `escrow_account_id` for the account of `owner_id`.
@@ -473,10 +530,17 @@ impl MintableFungibleToken {
         );
         assert!(verification_success, "Failed to verify the proof");
 
+        // total_gons is a multiple of INITIAL_FRAGMENTS_SUPPLY so that _gonsPerFragment is an integer.
+        // Use the highest value that fits in a uint256 for max granularity.
+        let total_gons: U256 = MAX_UINT256 - (MAX_UINT256 % INITIAL_FRAGMENTS_SUPPLY);
         let mut account = self.get_account(&new_owner_id);
         let amount: Balance = amount.into();
         account.balance += amount;
         self.total_supply += amount;
+        if self.total_supply > 0 {
+            let gons_per_fragment256 = total_gons / U256([self.total_supply as u64, 0, 0, 0]); // TODO: to fix, need to always use U256 for fragments
+            self.gons_per_fragment = gons_per_fragment256.to_string().parse::<u128>().unwrap();
+        }
         self.set_account(&new_owner_id, &account);
         self.refund_storage(initial_storage);
     }
@@ -574,18 +638,19 @@ impl MintableFungibleToken {
     /// to test.
     #[cfg(not(target_arch = "wasm32"))]
     #[cfg(test)]
-    fn new_with_supply(owner_id: AccountId, total_supply: U128) -> Self {
+    fn new_with_supply(owner_id: AccountId, total_supply: u128) -> Self {
         let prover_account = "testprover".to_string();
         let locker_address = [0u8; 20];
         assert!(
             env::is_valid_account_id(owner_id.as_bytes()),
             "Owner's account ID is invalid"
         );
-        let total_supply = total_supply.into();
+        let gons_per_fragment: u128 = (MAX_UINT256 - (MAX_UINT256 % INITIAL_FRAGMENTS_SUPPLY) / U256([total_supply as u64, 0, 0, 0])).to_string().parse::<u128>().unwrap();
         assert!(!env::state_exists(), "Already initialized");
         let mut ft = Self {
             accounts: UnorderedMap::new(b"a".to_vec()),
-            total_supply,
+            total_supply, 
+            gons_per_fragment,
             prover_account,
             locker_address,
             used_events: UnorderedSet::new(b"u".to_vec()),
