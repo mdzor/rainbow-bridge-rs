@@ -2,6 +2,7 @@ rainbow-bridge-rs
 =====================================
 
 WIP implementation of AMPL rebase in Near for Rainbow Hackathon
+2min explanation: https://youtu.be/wUYIM5qRX3s
 ----------
 
 TODO
